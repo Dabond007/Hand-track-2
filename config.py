@@ -28,7 +28,6 @@ ORBIT_VS_PAN_THRESHOLD = 0.6   # Ratio threshold for orbit vs pan weighting
 MAX_HANDS = 2
 DETECTION_CONFIDENCE = 0.7
 TRACKING_CONFIDENCE = 0.6
-MODEL_COMPLEXITY = 1
 
 # --- Camera ---
 CAMERA_INDEX = 0

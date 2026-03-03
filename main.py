@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 import time
 
@@ -18,7 +19,7 @@ import numpy as np
 
 import config
 from gesture_engine import GestureEngine, GestureState
-from hand_tracker import HandTracker
+from hand_tracker import HandTracker, MODEL_PATH
 from nx_controller import NXController
 
 logging.basicConfig(
@@ -83,6 +84,17 @@ def main():
     args = parser.parse_args()
 
     mirror = config.MIRROR_MODE and not args.no_mirror
+
+    # Verify model file exists before initializing components
+    if not os.path.isfile(MODEL_PATH):
+        logger.error(
+            "Hand landmarker model not found at %s. "
+            "Download it with:\n"
+            "  curl -L -o hand_landmarker.task "
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+            MODEL_PATH,
+        )
+        sys.exit(1)
 
     # Initialize components
     logger.info("Initializing webcam (index %d)...", args.camera)
