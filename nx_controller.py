@@ -4,11 +4,10 @@ NXOpen View Manipulation Controller.
 Provides pan, orbit, and zoom commands to the active Siemens NX 2406 view.
 Includes a MOCK_MODE for development/testing without NX running.
 
-IMPORTANT: The NXOpen API calls below are approximations based on the NXOpen
-Python API documentation. For production use:
-  1. Record a journal in NX 2406 of manual pan, orbit, and zoom operations.
-  2. Extract the actual Python API calls from the journal.
-  3. Update the methods below accordingly.
+API calls derived from NX 2406 journal recordings:
+  - Orbit: view.SetRotationTranslationScale(matrix3x3, translation, scale)
+  - Zoom:  view.ZoomAboutPoint(factor, scaleAboutPoint, viewCenter)
+  - Pan:   view.SetOrigin(point3d)
 """
 
 import logging
@@ -29,6 +28,7 @@ class NXController:
         self.mock_mode = mock_mode
         self._session = None
         self._view = None
+        self._NXOpen = None  # Cache the NXOpen module
 
         if not mock_mode:
             self._connect()
@@ -37,14 +37,13 @@ class NXController:
         """Connect to the active NX session."""
         try:
             import NXOpen
+            self._NXOpen = NXOpen
             self._session = NXOpen.Session.GetSession()
             work_part = self._session.Parts.Work
             if work_part is None:
                 logger.error("No work part open in NX session.")
                 return
-            # Get the current layout's view
-            layout = work_part.Layouts.Current
-            self._view = layout.GetView()
+            self._view = work_part.ModelingViews.WorkView
             logger.info("Connected to NX session. View: %s", self._view.Name)
         except ImportError:
             logger.error(
@@ -64,11 +63,13 @@ class NXController:
         return self.mock_mode or self._view is not None
 
     def pan(self, dx: float, dy: float):
-        """Pan (translate) the NX view.
+        """Pan (translate) the NX view by shifting the view origin.
+
+        Uses view.SetOrigin() as recorded in NX journals.
 
         Args:
-            dx: Horizontal pan delta (screen pixels).
-            dy: Vertical pan delta (screen pixels).
+            dx: Horizontal pan delta (screen-normalized, after sensitivity).
+            dy: Vertical pan delta (screen-normalized, after sensitivity).
         """
         if abs(dx) < 1e-6 and abs(dy) < 1e-6:
             return
@@ -81,14 +82,25 @@ class NXController:
             return
 
         try:
-            # NXOpen View.Pan(deltaX, deltaY) — screen-relative
-            # NOTE: Verify exact API signature from NX 2406 journal recording
-            self._view.Pan(dx, dy)
+            NXOpen = self._NXOpen
+            # Get current origin and shift by the pan delta.
+            # dx/dy are in screen-normalized units scaled by PAN_SENSITIVITY,
+            # so they map directly to view-space displacement.
+            origin = self._view.Origin
+            new_origin = NXOpen.Point3d(
+                origin.X + dx,
+                origin.Y - dy,  # Screen Y is inverted relative to model Y
+                origin.Z,
+            )
+            self._view.SetOrigin(new_origin)
         except Exception:
             logger.exception("NX Pan failed.")
 
     def orbit(self, angle_delta: float):
-        """Orbit (rotate) the NX view around the screen center.
+        """Orbit (rotate) the NX view around the screen Z-axis.
+
+        Uses view.SetRotationTranslationScale() as recorded in NX journals.
+        Applies an incremental rotation about the view's Z-axis (screen normal).
 
         Args:
             angle_delta: Rotation angle in radians.
@@ -105,19 +117,40 @@ class NXController:
             return
 
         try:
-            import NXOpen
-            # Rotate about the Z-axis (screen normal) through the view center.
-            # NOTE: Verify exact API from journal recording. The actual call
-            # may use View.Rotate(origin, axis, angle) or
-            # Display.Camera manipulation.
-            origin = NXOpen.Point3d(0.0, 0.0, 0.0)
-            axis = NXOpen.Vector3d(0.0, 0.0, 1.0)
-            self._view.Rotate(origin, axis, angle_delta)
+            NXOpen = self._NXOpen
+            # Get current view transform
+            rot = self._view.Matrix
+            translation = self._view.Origin
+            scale = self._view.Scale
+
+            # Build incremental rotation about the view Z-axis
+            c = math.cos(angle_delta)
+            s = math.sin(angle_delta)
+
+            # Multiply current rotation matrix by Z-rotation:
+            #   Rz = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+            #   new_R = Rz * current_R
+            new_rot = NXOpen.Matrix3x3()
+            new_rot.Xx = c * rot.Xx - s * rot.Yx
+            new_rot.Xy = c * rot.Xy - s * rot.Yy
+            new_rot.Xz = c * rot.Xz - s * rot.Yz
+            new_rot.Yx = s * rot.Xx + c * rot.Yx
+            new_rot.Yy = s * rot.Xy + c * rot.Yy
+            new_rot.Yz = s * rot.Xz + c * rot.Yz
+            new_rot.Zx = rot.Zx
+            new_rot.Zy = rot.Zy
+            new_rot.Zz = rot.Zz
+
+            # Preserve the current translation as a Point3d
+            trans_pt = NXOpen.Point3d(translation.X, translation.Y, translation.Z)
+            self._view.SetRotationTranslationScale(new_rot, trans_pt, scale)
         except Exception:
             logger.exception("NX Orbit failed.")
 
     def zoom(self, factor: float):
-        """Zoom the NX view.
+        """Zoom the NX view about its center.
+
+        Uses view.ZoomAboutPoint() as recorded in NX journals.
 
         Args:
             factor: Zoom factor. >1 = zoom in, <1 = zoom out, 1 = no change.
@@ -133,26 +166,12 @@ class NXController:
             return
 
         try:
-            # NXOpen View.Zoom(factor)
-            # NOTE: Verify exact API from journal recording.
-            self._view.Zoom(factor)
+            NXOpen = self._NXOpen
+            # Zoom about the screen center (0, 0, 0)
+            center = NXOpen.Point3d(0.0, 0.0, 0.0)
+            self._view.ZoomAboutPoint(factor, center, center)
         except Exception:
             logger.exception("NX Zoom failed.")
-
-    def refresh(self):
-        """Force a view refresh/redraw."""
-        if self.mock_mode:
-            return
-
-        if self._view is None:
-            return
-
-        try:
-            # Attempt to trigger a redraw
-            self._view.Regenerate()
-        except Exception:
-            # Some NX versions may not have Regenerate; silently ignore
-            pass
 
     def reconnect(self):
         """Attempt to reconnect to NX session."""

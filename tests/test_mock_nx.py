@@ -68,17 +68,42 @@ class TestNXControllerMockMode(unittest.TestCase):
 class TestNXControllerWithMockedNXOpen(unittest.TestCase):
     """Test NXController with a mocked NXOpen module."""
 
+    def _make_point3d(self, x=0.0, y=0.0, z=0.0):
+        pt = MagicMock()
+        pt.X = x
+        pt.Y = y
+        pt.Z = z
+        return pt
+
+    def _make_matrix3x3(self):
+        """Create an identity rotation matrix mock."""
+        m = MagicMock()
+        m.Xx, m.Xy, m.Xz = 1.0, 0.0, 0.0
+        m.Yx, m.Yy, m.Yz = 0.0, 1.0, 0.0
+        m.Zx, m.Zy, m.Zz = 0.0, 0.0, 1.0
+        return m
+
     def setUp(self):
         # Create a mock NXOpen module hierarchy
         self.mock_nxopen = MagicMock()
         self.mock_view = MagicMock()
         self.mock_view.Name = "TestView"
+        self.mock_view.Origin = self._make_point3d(100.0, 200.0, 300.0)
+        self.mock_view.Matrix = self._make_matrix3x3()
+        self.mock_view.Scale = 1.0
 
-        mock_layout = MagicMock()
-        mock_layout.GetView.return_value = self.mock_view
+        # Make Point3d constructor return a mock with the args as attributes
+        def make_point3d(x, y, z):
+            return self._make_point3d(x, y, z)
+        self.mock_nxopen.Point3d = make_point3d
+
+        # Make Matrix3x3 constructor return a writable mock
+        def make_matrix3x3():
+            return self._make_matrix3x3()
+        self.mock_nxopen.Matrix3x3 = make_matrix3x3
 
         mock_part = MagicMock()
-        mock_part.Layouts.Current = mock_layout
+        mock_part.ModelingViews.WorkView = self.mock_view
 
         mock_session = MagicMock()
         mock_session.Parts.Work = mock_part
@@ -97,22 +122,27 @@ class TestNXControllerWithMockedNXOpen(unittest.TestCase):
         self.assertTrue(ctrl.connected)
         self.assertEqual(ctrl._view, self.mock_view)
 
-    def test_pan_calls_view(self):
+    def test_pan_calls_set_origin(self):
         ctrl = NXController(mock_mode=False)
         ctrl.pan(10.0, -5.0)
-        self.mock_view.Pan.assert_called_once_with(10.0, -5.0)
+        self.mock_view.SetOrigin.assert_called_once()
+        pt = self.mock_view.SetOrigin.call_args[0][0]
+        # dx=10 added to X=100, dy=-5 subtracted from Y=200 (inverted)
+        self.assertAlmostEqual(pt.X, 110.0)
+        self.assertAlmostEqual(pt.Y, 205.0)  # Y - (-5) = Y + 5
+        self.assertAlmostEqual(pt.Z, 300.0)
 
-    def test_orbit_calls_view(self):
+    def test_orbit_calls_set_rotation_translation_scale(self):
         ctrl = NXController(mock_mode=False)
         ctrl.orbit(0.5)
-        self.mock_view.Rotate.assert_called_once()
-        args = self.mock_view.Rotate.call_args[0]
-        self.assertAlmostEqual(args[2], 0.5)  # angle
+        self.mock_view.SetRotationTranslationScale.assert_called_once()
 
-    def test_zoom_calls_view(self):
+    def test_zoom_calls_zoom_about_point(self):
         ctrl = NXController(mock_mode=False)
         ctrl.zoom(1.2)
-        self.mock_view.Zoom.assert_called_once_with(1.2)
+        self.mock_view.ZoomAboutPoint.assert_called_once()
+        args = self.mock_view.ZoomAboutPoint.call_args[0]
+        self.assertAlmostEqual(args[0], 1.2)  # factor
 
     def test_reconnect(self):
         ctrl = NXController(mock_mode=False)
