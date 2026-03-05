@@ -1,27 +1,24 @@
 """
 NX Hand Tracking 3D Mouse — Entry Point.
 
-Main loop: capture frame → process hands → update gesture state → send NX commands.
+When run as an NX Journal, this script launches a lightweight subprocess
+(tracker_service.py) that handles all heavy work (webcam, MediaPipe, OpenCV).
+Commands are streamed back over a pipe and applied to the NX view.
+
+This keeps NX responsive — no heavy libraries are loaded in the NX process.
 
 Usage:
     Standalone:    python main.py [--mock] [--overlay] [--no-mirror]
     NX Journal:    Execute from NX via File > Execute > NX Open
 """
 
-import argparse
+import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
-
-import cv2
-import numpy as np
-
-import config
-from gesture_engine import GestureEngine, GestureState
-from hand_tracker import HandTracker, MODEL_PATH
-from nx_controller import NXController
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,50 +26,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flag used to signal the tracking thread to stop
-_stop_event = threading.Event()
-
-# State labels for HUD
-_STATE_LABELS = {
-    GestureState.IDLE: "IDLE",
-    GestureState.SINGLE_HAND_ACTIVE: "SINGLE HAND",
-    GestureState.TWO_HAND_ZOOM: "TWO HAND ZOOM",
-}
+# Directory where this script lives
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def draw_hud(frame: np.ndarray, output, fps: float):
-    """Draw a status overlay on the frame."""
-    h, w = frame.shape[:2]
-    # Semi-transparent bar at the top
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 60), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+def _find_venv_python() -> str:
+    """Locate the venv Python interpreter.
 
-    state_text = _STATE_LABELS.get(output.state, "UNKNOWN")
-    color = {
-        GestureState.IDLE: (128, 128, 128),
-        GestureState.SINGLE_HAND_ACTIVE: (0, 255, 0),
-        GestureState.TWO_HAND_ZOOM: (0, 200, 255),
-    }.get(output.state, (255, 255, 255))
+    Searches common locations relative to the project.
+    """
+    candidates = [
+        # .venv next to the Hand-track-2 folder
+        os.path.join(_SCRIPT_DIR, "..", ".venv", "Scripts", "python.exe"),
+        # .venv inside the project folder
+        os.path.join(_SCRIPT_DIR, ".venv", "Scripts", "python.exe"),
+        # Linux/Mac variants
+        os.path.join(_SCRIPT_DIR, "..", ".venv", "bin", "python"),
+        os.path.join(_SCRIPT_DIR, ".venv", "bin", "python"),
+    ]
+    for path in candidates:
+        resolved = os.path.normpath(path)
+        if os.path.isfile(resolved):
+            logger.info("Found venv Python: %s", resolved)
+            return resolved
 
-    cv2.putText(frame, f"State: {state_text}", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-    details = []
-    if output.state == GestureState.SINGLE_HAND_ACTIVE:
-        details.append(f"Pan: ({output.pan_dx:+.2f}, {output.pan_dy:+.2f})")
-        details.append(f"Orbit: {output.orbit_delta:+.4f} rad")
-        if output.active_hand:
-            details.append(f"Hand: {output.active_hand}")
-    elif output.state == GestureState.TWO_HAND_ZOOM:
-        details.append(f"Zoom: {output.zoom_factor:.4f}")
-
-    detail_str = "  |  ".join(details)
-    cv2.putText(frame, detail_str, (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-
-    cv2.putText(frame, f"FPS: {fps:.0f}", (w - 90, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    # Fallback: hope "python" on PATH is the right one
+    logger.warning("Could not find venv Python — falling back to 'python'")
+    return "python"
 
 
 def _detect_nx_journal() -> bool:
@@ -84,12 +64,90 @@ def _detect_nx_journal() -> bool:
         return False
 
 
-def _tracking_loop(args, mirror: bool):
-    """Core capture → process → command loop.
+# ---------------------------------------------------------------------------
+# NX Journal mode — subprocess + pipe
+# ---------------------------------------------------------------------------
 
-    Runs until ``_stop_event`` is set or the webcam fails.
-    """
-    # Verify model file exists before initializing components
+def _run_nx_journal():
+    """Launch the tracker subprocess and feed commands into NX."""
+    from nx_controller import NXController
+
+    nx = NXController(mock_mode=False)
+    if not nx.connected:
+        logger.error("Could not connect to NX session. Aborting.")
+        return
+
+    python_exe = _find_venv_python()
+    tracker_script = os.path.join(_SCRIPT_DIR, "tracker_service.py")
+
+    logger.info("Launching tracker subprocess...")
+    proc = subprocess.Popen(
+        [python_exe, tracker_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,                # line-buffered
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+
+    def _read_commands():
+        """Read JSON lines from the subprocess and apply NX commands."""
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("Bad JSON from tracker: %s", line)
+                    continue
+
+                msg_type = msg.get("type")
+                if msg_type == "ready":
+                    logger.info("Tracker subprocess is ready.")
+                elif msg_type == "error":
+                    logger.error("Tracker error: %s", msg.get("msg"))
+                elif msg_type == "stopped":
+                    logger.info("Tracker subprocess stopped.")
+                    break
+                elif msg_type == "cmd":
+                    action = msg.get("action")
+                    if action == "single":
+                        nx.pan(msg["pan_dx"], msg["pan_dy"])
+                        nx.orbit(msg["orbit_delta"])
+                    elif action == "zoom":
+                        nx.zoom(msg["zoom_factor"])
+        except Exception:
+            logger.exception("Command reader thread failed.")
+        finally:
+            proc.terminate()
+
+    t = threading.Thread(target=_read_commands, name="TrackerReader", daemon=True)
+    t.start()
+    logger.info(
+        "Hand tracker running in background (PID %d). "
+        "Close NX or kill PID %d to stop.",
+        proc.pid, proc.pid,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Standalone mode — everything in-process (original behaviour)
+# ---------------------------------------------------------------------------
+
+def _run_standalone(args):
+    """Run the full tracking loop in-process (no NX required)."""
+    import cv2
+    import numpy as np
+
+    import config
+    from gesture_engine import GestureEngine, GestureState
+    from hand_tracker import HandTracker, MODEL_PATH
+    from nx_controller import NXController
+
+    mirror = config.MIRROR_MODE and not args.no_mirror
+
     if not os.path.isfile(MODEL_PATH):
         logger.error(
             "Hand landmarker model not found at %s. "
@@ -98,25 +156,18 @@ def _tracking_loop(args, mirror: bool):
             "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
             MODEL_PATH,
         )
-        return
+        sys.exit(1)
 
-    # Initialize components
-    logger.info("Initializing webcam (index %d)...", args.camera)
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         logger.error("Failed to open webcam at index %d.", args.camera)
-        return
+        sys.exit(1)
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
 
-    logger.info("Initializing hand tracker...")
     tracker = HandTracker()
-
-    logger.info("Initializing gesture engine...")
     engine = GestureEngine()
-
-    logger.info("Initializing NX controller (mock=%s)...", args.mock)
     nx = NXController(mock_mode=args.mock)
 
     if not nx.connected:
@@ -125,52 +176,47 @@ def _tracking_loop(args, mirror: bool):
             "will not be sent. Use --mock for dry-run mode."
         )
 
-    # NX reconnection timer
-    nx_reconnect_interval = 10.0  # seconds
-    last_nx_reconnect = time.monotonic()
+    # State labels for HUD
+    state_labels = {
+        GestureState.IDLE: "IDLE",
+        GestureState.SINGLE_HAND_ACTIVE: "SINGLE HAND",
+        GestureState.TWO_HAND_ZOOM: "TWO HAND ZOOM",
+    }
 
-    # FPS tracking
+    nx_reconnect_interval = 10.0
+    last_nx_reconnect = time.monotonic()
     frame_count = 0
     fps_start = time.monotonic()
     current_fps = 0.0
 
-    logger.info("Starting tracking loop. Press 'q' in overlay to quit.")
+    logger.info("Starting main loop. Press 'q' to quit.")
 
     try:
-        while not _stop_event.is_set():
+        while True:
             ret, frame = cap.read()
             if not ret:
                 logger.error("Webcam read failed. Exiting.")
                 break
 
-            # Mirror if configured
             if mirror:
                 frame = cv2.flip(frame, 1)
 
-            # Convert BGR to RGB for MediaPipe
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            # Process hand tracking
             hands = tracker.process_frame(frame_rgb)
-
-            # Update gesture engine
             output = engine.update(hands)
 
-            # Send commands to NX
             if output.state == GestureState.SINGLE_HAND_ACTIVE:
                 nx.pan(output.pan_dx, output.pan_dy)
                 nx.orbit(output.orbit_delta)
             elif output.state == GestureState.TWO_HAND_ZOOM:
                 nx.zoom(output.zoom_factor)
 
-            # Periodically try to reconnect NX if not connected
             if not nx.connected:
                 now = time.monotonic()
                 if now - last_nx_reconnect > nx_reconnect_interval:
                     nx.reconnect()
                     last_nx_reconnect = now
 
-            # FPS calculation
             frame_count += 1
             elapsed = time.monotonic() - fps_start
             if elapsed >= 1.0:
@@ -178,13 +224,19 @@ def _tracking_loop(args, mirror: bool):
                 frame_count = 0
                 fps_start = time.monotonic()
 
-            # Overlay window
             if args.overlay:
                 tracker.draw_landmarks(frame, hands)
-                draw_hud(frame, output, current_fps)
+                h, w = frame.shape[:2]
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (0, 0), (w, 60), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+                state_text = state_labels.get(output.state, "UNKNOWN")
+                cv2.putText(frame, f"State: {state_text}", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(frame, f"FPS: {current_fps:.0f}", (w - 90, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
                 cv2.imshow("NX Hand Tracker", frame)
 
-            # Check for quit (waitKey also pumps the OpenCV event loop)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 logger.info("Quit requested.")
@@ -200,38 +252,24 @@ def _tracking_loop(args, mirror: bool):
         logger.info("Done.")
 
 
-def _parse_args():
-    """Parse CLI arguments (returns defaults when run as NX journal)."""
-    parser = argparse.ArgumentParser(description="NX Hand Tracking 3D Mouse")
-    parser.add_argument("--mock", action="store_true",
-                        help="Run in mock mode (no NX connection)")
-    parser.add_argument("--overlay", action="store_true",
-                        help="Show webcam overlay with landmarks and HUD")
-    parser.add_argument("--no-mirror", action="store_true",
-                        help="Disable webcam mirroring")
-    parser.add_argument("--camera", type=int, default=config.CAMERA_INDEX,
-                        help="Camera index (default: %(default)s)")
-    # When NX runs a journal it may pass extra args; ignore them.
-    args, _unknown = parser.parse_known_args()
-    return args
-
-
 def main():
-    args = _parse_args()
-    mirror = config.MIRROR_MODE and not args.no_mirror
-
     if _detect_nx_journal():
-        # Running inside NX — launch the tracking loop on a daemon thread
-        # so the NX UI thread is not blocked.
-        logger.info("NX Journal detected — starting hand tracker in background thread.")
-        _stop_event.clear()
-        t = threading.Thread(target=_tracking_loop, args=(args, mirror), daemon=True)
-        t.start()
-        # Return immediately so NX remains responsive.
-        # The daemon thread will be cleaned up when NX exits.
+        _run_nx_journal()
     else:
-        # Standalone mode — run on the main thread as before.
-        _tracking_loop(args, mirror)
+        import argparse
+        import config
+
+        parser = argparse.ArgumentParser(description="NX Hand Tracking 3D Mouse")
+        parser.add_argument("--mock", action="store_true",
+                            help="Run in mock mode (no NX connection)")
+        parser.add_argument("--overlay", action="store_true",
+                            help="Show webcam overlay with landmarks and HUD")
+        parser.add_argument("--no-mirror", action="store_true",
+                            help="Disable webcam mirroring")
+        parser.add_argument("--camera", type=int, default=config.CAMERA_INDEX,
+                            help="Camera index (default: %(default)s)")
+        args = parser.parse_args()
+        _run_standalone(args)
 
 
 if __name__ == "__main__":
