@@ -2,17 +2,17 @@
 NX Hand Tracking 3D Mouse — Entry Point.
 
 When run as an NX Journal, this script launches a lightweight subprocess
-(tracker_service.py) that handles all heavy work (webcam, MediaPipe, OpenCV).
-Commands are streamed back over a pipe and applied to the NX view.
+(tracker_service.py) that handles all heavy work (webcam, MediaPipe, OpenCV)
+and drives the NX viewport via simulated Win32 mouse input.
 
-This keeps NX responsive — no heavy libraries are loaded in the NX process.
+No NXOpen API calls are made from Python — this avoids the main-thread
+restriction that causes NX to freeze.
 
 Usage:
     Standalone:    python main.py [--mock] [--overlay] [--no-mirror]
     NX Journal:    Execute from NX via File > Execute > NX Open
 """
 
-import json
 import logging
 import os
 import subprocess
@@ -69,14 +69,12 @@ def _detect_nx_journal() -> bool:
 # ---------------------------------------------------------------------------
 
 def _run_nx_journal():
-    """Launch the tracker subprocess and feed commands into NX."""
-    from nx_controller import NXController
+    """Launch the tracker subprocess.
 
-    nx = NXController(mock_mode=False)
-    if not nx.connected:
-        logger.error("Could not connect to NX session. Aborting.")
-        return
-
+    The subprocess handles everything — webcam, gesture detection, and
+    viewport control via simulated Win32 mouse input.  No NXOpen calls
+    are made from Python at all, so there is no main-thread requirement.
+    """
     python_exe = _find_venv_python()
     tracker_script = os.path.join(_SCRIPT_DIR, "tracker_service.py")
 
@@ -86,59 +84,24 @@ def _run_nx_journal():
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        bufsize=1,                # line-buffered
+        bufsize=1,
         text=True,
     )
 
-    def _log_stderr():
-        """Forward subprocess stderr to NX log so errors are visible."""
+    def _log_output():
+        """Forward subprocess stdout/stderr so the user can see status."""
         try:
             for line in proc.stderr:
-                logger.error("tracker_service: %s", line.rstrip())
+                logger.info("tracker: %s", line.rstrip())
         except Exception:
             pass
 
-    def _read_commands():
-        """Read JSON lines from the subprocess and apply NX commands."""
-        try:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning("Bad JSON from tracker: %s", line)
-                    continue
-
-                msg_type = msg.get("type")
-                if msg_type == "ready":
-                    logger.info("Tracker subprocess is ready.")
-                elif msg_type == "error":
-                    logger.error("Tracker error: %s", msg.get("msg"))
-                elif msg_type == "stopped":
-                    logger.info("Tracker subprocess stopped.")
-                    break
-                elif msg_type == "cmd":
-                    action = msg.get("action")
-                    if action == "single":
-                        nx.pan(msg["pan_dx"], msg["pan_dy"])
-                        nx.orbit(msg["orbit_delta"])
-                    elif action == "zoom":
-                        nx.zoom(msg["zoom_factor"])
-        except Exception:
-            logger.exception("Command reader thread failed.")
-        finally:
-            proc.terminate()
-
-    t_err = threading.Thread(target=_log_stderr, name="TrackerStderr", daemon=True)
-    t_err.start()
-    t_cmd = threading.Thread(target=_read_commands, name="TrackerReader", daemon=True)
-    t_cmd.start()
+    t = threading.Thread(target=_log_output, name="TrackerLog", daemon=True)
+    t.start()
     logger.info(
         "Hand tracker running in background (PID %d). "
-        "Close NX or kill PID %d to stop.",
-        proc.pid, proc.pid,
+        "Press 'q' in the overlay window to stop.",
+        proc.pid,
     )
 
 
