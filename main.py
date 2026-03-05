@@ -80,15 +80,23 @@ def _run_nx_journal():
     python_exe = _find_venv_python()
     tracker_script = os.path.join(_SCRIPT_DIR, "tracker_service.py")
 
-    logger.info("Launching tracker subprocess...")
+    cmd = [python_exe, tracker_script, "--overlay"]
+    logger.info("Launching tracker subprocess: %s", " ".join(cmd))
     proc = subprocess.Popen(
-        [python_exe, tracker_script],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=1,                # line-buffered
         text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
+
+    def _log_stderr():
+        """Forward subprocess stderr to NX log so errors are visible."""
+        try:
+            for line in proc.stderr:
+                logger.error("tracker_service: %s", line.rstrip())
+        except Exception:
+            pass
 
     def _read_commands():
         """Read JSON lines from the subprocess and apply NX commands."""
@@ -123,8 +131,10 @@ def _run_nx_journal():
         finally:
             proc.terminate()
 
-    t = threading.Thread(target=_read_commands, name="TrackerReader", daemon=True)
-    t.start()
+    t_err = threading.Thread(target=_log_stderr, name="TrackerStderr", daemon=True)
+    t_err.start()
+    t_cmd = threading.Thread(target=_read_commands, name="TrackerReader", daemon=True)
+    t_cmd.start()
     logger.info(
         "Hand tracker running in background (PID %d). "
         "Close NX or kill PID %d to stop.",

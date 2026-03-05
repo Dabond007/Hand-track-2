@@ -34,9 +34,11 @@ def main():
         _send({"type": "error", "msg": f"Model not found: {MODEL_PATH}"})
         return
 
-    camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else config.CAMERA_INDEX
-    mirror = config.MIRROR_MODE
     show_overlay = "--overlay" in sys.argv
+    # Camera index is the first positional (non-flag) argument, if any
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    camera_index = int(positional[0]) if positional else config.CAMERA_INDEX
+    mirror = config.MIRROR_MODE
 
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
