@@ -12,6 +12,7 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 
 import cv2
@@ -27,6 +28,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Flag used to signal the tracking thread to stop
+_stop_event = threading.Event()
 
 # State labels for HUD
 _STATE_LABELS = {
@@ -71,20 +75,20 @@ def draw_hud(frame: np.ndarray, output, fps: float):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="NX Hand Tracking 3D Mouse")
-    parser.add_argument("--mock", action="store_true",
-                        help="Run in mock mode (no NX connection)")
-    parser.add_argument("--overlay", action="store_true",
-                        help="Show webcam overlay with landmarks and HUD")
-    parser.add_argument("--no-mirror", action="store_true",
-                        help="Disable webcam mirroring")
-    parser.add_argument("--camera", type=int, default=config.CAMERA_INDEX,
-                        help="Camera index (default: %(default)s)")
-    args = parser.parse_args()
+def _detect_nx_journal() -> bool:
+    """Return True when running inside Siemens NX as a journal."""
+    try:
+        import NXOpen  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
-    mirror = config.MIRROR_MODE and not args.no_mirror
 
+def _tracking_loop(args, mirror: bool):
+    """Core capture → process → command loop.
+
+    Runs until ``_stop_event`` is set or the webcam fails.
+    """
     # Verify model file exists before initializing components
     if not os.path.isfile(MODEL_PATH):
         logger.error(
@@ -94,14 +98,14 @@ def main():
             "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
             MODEL_PATH,
         )
-        sys.exit(1)
+        return
 
     # Initialize components
     logger.info("Initializing webcam (index %d)...", args.camera)
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         logger.error("Failed to open webcam at index %d.", args.camera)
-        sys.exit(1)
+        return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
@@ -130,10 +134,10 @@ def main():
     fps_start = time.monotonic()
     current_fps = 0.0
 
-    logger.info("Starting main loop. Press 'q' to quit.")
+    logger.info("Starting tracking loop. Press 'q' in overlay to quit.")
 
     try:
-        while True:
+        while not _stop_event.is_set():
             ret, frame = cap.read()
             if not ret:
                 logger.error("Webcam read failed. Exiting.")
@@ -180,7 +184,7 @@ def main():
                 draw_hud(frame, output, current_fps)
                 cv2.imshow("NX Hand Tracker", frame)
 
-            # Check for quit
+            # Check for quit (waitKey also pumps the OpenCV event loop)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 logger.info("Quit requested.")
@@ -194,6 +198,40 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         logger.info("Done.")
+
+
+def _parse_args():
+    """Parse CLI arguments (returns defaults when run as NX journal)."""
+    parser = argparse.ArgumentParser(description="NX Hand Tracking 3D Mouse")
+    parser.add_argument("--mock", action="store_true",
+                        help="Run in mock mode (no NX connection)")
+    parser.add_argument("--overlay", action="store_true",
+                        help="Show webcam overlay with landmarks and HUD")
+    parser.add_argument("--no-mirror", action="store_true",
+                        help="Disable webcam mirroring")
+    parser.add_argument("--camera", type=int, default=config.CAMERA_INDEX,
+                        help="Camera index (default: %(default)s)")
+    # When NX runs a journal it may pass extra args; ignore them.
+    args, _unknown = parser.parse_known_args()
+    return args
+
+
+def main():
+    args = _parse_args()
+    mirror = config.MIRROR_MODE and not args.no_mirror
+
+    if _detect_nx_journal():
+        # Running inside NX — launch the tracking loop on a daemon thread
+        # so the NX UI thread is not blocked.
+        logger.info("NX Journal detected — starting hand tracker in background thread.")
+        _stop_event.clear()
+        t = threading.Thread(target=_tracking_loop, args=(args, mirror), daemon=True)
+        t.start()
+        # Return immediately so NX remains responsive.
+        # The daemon thread will be cleaned up when NX exits.
+    else:
+        # Standalone mode — run on the main thread as before.
+        _tracking_loop(args, mirror)
 
 
 if __name__ == "__main__":
